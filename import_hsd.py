@@ -224,9 +224,9 @@ def trav_animjoints_total(joint, animjoint, action, pose):
                 print('JOBJ_EFFECTOR')
         while robj:
             print('ROBJ: %.8X TYPE: %.8X SUBTYPE: %.8X' % (robj.id, robj.flags & 0x70000000, robj.flags & 0x0FFFFFFF))
-            if (robj.flags & 0x70000000 == 0x10000000):
+            if (robj.flags & 0x70000000 == 0x10000000): # position
                 print(' JointRef: ' + robj.u.temp_name)
-            elif (robj.flags & 0x70000000 == 0x40000000):
+            elif (robj.flags & 0x70000000 == 0x40000000): # bone length and pole angle
                 print(' VAL0: %f VAL1: %f' % (robj.val0, robj.val1))
             robj = robj.next
         if animjoint.robjanim:
@@ -265,6 +265,7 @@ def add_jointanim_to_armature_total(joint, aobjdesc, action, pose):
         return
     fobj = aobjdesc.fobjdesc
     invmtx = joint.temp_matrix_local.inverted()
+    _, _, invmtxscale = invmtx.decompose()
     #invmtx = invmtx * Matrix.Translation(Vector((0.0,1.0,0.0)))
     transform_list = [0] * (TRANSFORMCOUNT)
     while fobj:
@@ -281,7 +282,7 @@ def add_jointanim_to_armature_total(joint, aobjdesc, action, pose):
             #total values for testing
             curve_bias = 0
             curve_scale = 1
-            read_fobjdesc(fobj, curve, curve_bias, curve_scale, False)
+            read_fobjdesc(fobj, curve, curve_bias, curve_scale, False, False)
 
             if aobjdesc.flags & hsd.AOBJ_ANIM_LOOP:
                 curve.modifiers.new('CYCLES')
@@ -333,9 +334,10 @@ def add_jointanim_to_armature_total(joint, aobjdesc, action, pose):
         new_transform_list[0].keyframe_points.insert(frame, rot[0]).interpolation = 'BEZIER'
         new_transform_list[1].keyframe_points.insert(frame, rot[1]).interpolation = 'BEZIER'
         new_transform_list[2].keyframe_points.insert(frame, rot[2]).interpolation = 'BEZIER'
-        new_transform_list[4].keyframe_points.insert(frame, trans[0]).interpolation = 'BEZIER'
-        new_transform_list[5].keyframe_points.insert(frame, trans[1]).interpolation = 'BEZIER'
-        new_transform_list[6].keyframe_points.insert(frame, trans[2]).interpolation = 'BEZIER'
+        # scale of edit bone does not seem to affect pose translations
+        new_transform_list[4].keyframe_points.insert(frame, trans[0] / invmtxscale[0]).interpolation = 'BEZIER'
+        new_transform_list[5].keyframe_points.insert(frame, trans[1] / invmtxscale[1]).interpolation = 'BEZIER'
+        new_transform_list[6].keyframe_points.insert(frame, trans[2] / invmtxscale[2]).interpolation = 'BEZIER'
         new_transform_list[7].keyframe_points.insert(frame, scale[0]).interpolation = 'BEZIER'
         new_transform_list[8].keyframe_points.insert(frame, scale[1]).interpolation = 'BEZIER'
         new_transform_list[9].keyframe_points.insert(frame, scale[2]).interpolation = 'BEZIER'
@@ -386,17 +388,13 @@ def add_jointanim_to_armature(joint, aobjdesc, action):
     trans, rot, scale = joint.position, joint.rotation, joint.scale
     #if aobjdesc.flags & hsd.AOBJ_NO_ANIM:
     #    return
-    printd = (joint.temp_name == 'Bone57')
-    if printd:
-        print(action.name)
-        print('AOBJ FLAGS: %.8X' % aobjdesc.flags)
     fobj = aobjdesc.fobjdesc
     transform_list = [0] * 10
     while fobj:
         #print(hsd_a_j_dict[fobj.type])
         if fobj.type == hsd.HSD_A_J_PATH:
             #TODO: implement paths
-            print('HSD_A_J_PATH')
+            print('------ HSD_A_J_PATH ------')
         elif (fobj.type >= hsd.HSD_A_J_ROTX and fobj.type <= hsd.HSD_A_J_SCAZ):
             data_type, component = jointanim_type_dict[fobj.type]
             data_path = 'pose.bones["' + joint.temp_name + '"]' + '.' + data_type
@@ -511,7 +509,7 @@ hsd_a_j_dict = {
     hsd.HSD_A_J_SETFLOAT9: 'HSD_A_J_SETFLOAT9',
 }
 
-def read_fobjdesc(fobjdesc, curve, bias, scale, printd):
+def read_fobjdesc(fobjdesc, curve, bias, scale, printd, printopcode = False):
     printa = printd
     printd = 0
     current_frame = 0 - fobjdesc.startframe // 1
@@ -548,13 +546,16 @@ def read_fobjdesc(fobjdesc, curve, bias, scale, printd):
         #there's always at least one node
         node_count += 1
 
+        if printopcode:
+            print(hsd_a_j_dict[fobjdesc.type], opcode_dict[opcode], node_count)
+
         if opcode == hsd.HSD_A_OP_SLP:
             for i in range(node_count):
                 _, cur_slope, cur_pos = read_node_values(opcode, value_type, frac_value, slope_type, frac_slope, ad, cur_pos)
         else:
             for i in range(node_count):
                 val, slope, cur_pos = read_node_values(opcode, value_type, frac_value, slope_type, frac_slope, ad, cur_pos)
-                if printd:
+                if printd or printopcode:
                     print(val)
                 slopes.append((cur_slope, slope))
                 cur_slope = slope
@@ -946,6 +947,7 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
             #this only has potential effects on the alpha channel, but I haven't seen a specular map use alpha yet
             if (texdesc.flag & hsd.TEX_LIGHTMAP_MASK) & (hsd.TEX_LIGHTMAP_DIFFUSE | hsd.TEX_LIGHTMAP_AMBIENT | hsd.TEX_LIGHTMAP_SPECULAR | hsd.TEX_LIGHTMAP_EXT):
                 if texdesc.flag & hsd.TEX_LIGHTMAP_SPECULAR and not mobj.rendermode & hsd.RENDER_SPECULAR:
+                    print('skippig specular lightmap')
                     continue
                 colormap = texdesc.flag & hsd.TEX_COLORMAP_MASK
                 if not (colormap == hsd.TEX_COLORMAP_NONE or
@@ -1734,9 +1736,9 @@ def load_model(root_joint, mesh_dict, material_dict):
     arm_object.select_set(True)
 
     #using the hack the bones will be too small to see otherwise
-    global ikhack
-    if ikhack:
-        arm_data.display_type = 'STICK'
+    # global ikhack
+    # if ikhack:
+    #     arm_data.display_type = 'STICK'
 
     #add bones
     bpy.context.view_layer.objects.active = armature
@@ -1745,7 +1747,10 @@ def load_model(root_joint, mesh_dict, material_dict):
     global bone_count
     bone_count = 0
     bones = build_bone_hierarchy(arm_data, root_joint)
-
+    
+    print(f'ARMATURE CONTAINS {len(arm_data.edit_bones)} BONES')
+    bpy.ops.object.mode_set(mode = 'OBJECT')
+    print(f'ARMATURE CONTAINS {len(armature.pose.bones)} BONES')
 
     bpy.ops.object.mode_set(mode = 'POSE')
     add_geometry(armature, bones, mesh_dict)
@@ -1800,8 +1805,21 @@ def robj_get_by_type(joint, type, subtype):
         robj = robj.next
     return None
 
+ROBJ_ACTIVE_BIT  = 0x80000000 
+
+ROBJ_TYPE_MASK   = 0x70000000
+REFTYPE_EXP      = 0x00000000
+REFTYPE_JOBJ     = 0x10000000
+REFTYPE_LIMIT    = 0x20000000
+REFTYPE_BYTECODE = 0x30000000
+REFTYPE_IKHINT   = 0x40000000
+
+ROBJ_CNST_MASK   = 0x0FFFFFFF
+
+
 def add_contraints(armature, bones):
     for hsd_joint in bones:
+        # IK constraint
         if hsd_joint.flags & hsd.JOBJ_TYPE_MASK == hsd.JOBJ_EFFECTOR:
             if not hsd_joint.temp_parent:
                 notice_output("IK Effector has no Parent")
@@ -1814,17 +1832,40 @@ def add_contraints(armature, bones):
                 pole_data_joint = hsd_joint.temp_parent
             target_robj = robj_get_by_type(hsd_joint, 0x10000000, 1)
             poletarget_robj = robj_get_by_type(pole_data_joint, 0x10000000, 0)
-            length_robj = robj_get_by_type(hsd_joint.temp_parent, 0x40000000, 0)
-            if not length_robj:
+            effector_length_robj = robj_get_by_type(hsd_joint.temp_parent, 0x40000000, 0)
+            joint2_length_robj = robj_get_by_type(pole_data_joint, 0x40000000, 0)
+            if not effector_length_robj:
                 notice_output("No Pole angle and bone length constraint on IK Effector Parent")
                 continue
-            bone_length = length_robj.val0
-            pole_angle = length_robj.val1
-            if length_robj.flags & 0x4:
+            
+            if joint2_length_robj:
+                pole_angle = joint2_length_robj.val1
+            else:
+                # idk if this makes any sense, as good of a fallback as any
+                pole_angle = effector_length_robj.val1
+            if effector_length_robj.flags & 0x4:
                 pole_angle += math.pi #+180°
-            #This is a hack needed due to how the IK systems differ
-            #May break on models using a different exporter than the one used for XD/Colosseum
-            #(Or just some inconveniently placed children)
+
+            # enforce second bone length if present
+            if chain_length == 3:
+                joint1 = armature.data.bones[hsd_joint.temp_parent.temp_name]
+                joint1_pos = Vector(joint1.matrix_local.translation)
+                joint1_name = joint1.name
+                bpy.context.view_layer.objects.active = armature
+                bpy.ops.object.mode_set(mode = 'EDIT')
+                position = Vector(joint1.parent.matrix_local.translation)
+                direction = Vector(joint1.parent.matrix_local.col[0][0:3]).normalized()
+                bone_length = joint2_length_robj.val0
+                direction *= bone_length * joint1.parent.matrix_local.to_scale()[0]
+                position += direction
+                
+                headpos = Vector(armature.data.edit_bones[joint1_name].head[:]) + (position - joint1_pos)
+                armature.data.edit_bones[joint1_name].head[:] = headpos[:]
+                tailpos = Vector(armature.data.edit_bones[joint1_name].tail[:]) + (position - joint1_pos)
+                armature.data.edit_bones[joint1_name].tail[:] = tailpos[:]
+                bpy.ops.object.mode_set(mode = 'POSE')
+            
+            # enforce effector bone length and direction
             effector = armature.data.bones[hsd_joint.temp_name]
             effector_pos = Vector(effector.matrix_local.translation)
             effector_name = effector.name
@@ -1832,8 +1873,10 @@ def add_contraints(armature, bones):
             bpy.ops.object.mode_set(mode = 'EDIT')
             position = Vector(effector.parent.matrix_local.translation)
             direction = Vector(effector.parent.matrix_local.col[0][0:3]).normalized()
+            bone_length = effector_length_robj.val0
             direction *= bone_length * effector.parent.matrix_local.to_scale()[0]
             position += direction
+            
             #XXX contrary to documentation, .translate() doesn't seem to exist on EditBones in 2.81
             #Swap this back when this gets fixed
             #armature.data.edit_bones[effector_name].translate(position - effector_pos)
@@ -1868,8 +1911,129 @@ def add_contraints(armature, bones):
             #    notice_output("No Pos constraint RObj on IK Effector")
             #else:
             #    notice_output("Adding IK contraint to Bone without Bone parents has no effect")
+        elif hsd_joint.flags & hsd.JOBJ_TYPE_MASK == hsd.JOBJ_JOINT2:
+             # EFFECTOR and JOINT2 cannot have other constraints
+             pass
+        else:
+            # regular constraints:
+            constraints_by_type = {
+                'copy_pos'    : [],
+                'dirup_x'     : None,
+                'dirup_y'     : None,
+                'orientation' : None,
+                'limits'      : [],
+                'expressions' : [],
+            }
+            robj = hsd_joint.robj
+            while robj:
+                if robj.flags & ROBJ_ACTIVE_BIT == 0:
+                    continue # disabled
+                
+                reference_type = robj.flags & ROBJ_TYPE_MASK
+                constraint_type = robj.flags & ROBJ_CNST_MASK
 
+                if reference_type == REFTYPE_EXP: # custom expression constraint
+                    # currently unimplemented, should be implemented using drivers
+                    print('Custom expression constraints are not implemented!')
+                    constraints_by_type['expressions'].append(robj)
+                elif reference_type == REFTYPE_JOBJ: # joint reference constraints
+                    if not robj.u:
+                        print('Joint Reference without joint!')
+                        continue 
 
+                    if constraint_type == 1: # position copy constraint
+                        constraints_by_type['copy_pos'].append(robj) 
+                    elif constraint_type == 2: # point to (dirup) constraint x-dir target
+                        constraints_by_type['dirup_x'] = robj
+                    elif constraint_type == 3: # point to (dirup) constraint y-dir target
+                        constraints_by_type['dirup_y'] = robj
+                    elif constraint_type == 4: # orientation copy constraint
+                        constraints_by_type['orientation'] = robj
+                    else:
+                        print(f'Invalid ref constraint type {constraint_type}!')
+
+                elif reference_type == REFTYPE_LIMIT: # parameter limit constraint
+                    if constraint_type < 1 or constraint_type > 12:
+                        continue
+                    limit_variable  = ['rot', 'pos'][(constraint_type - 1) // (2 * 3)]
+                    limit_component = ((constraint_type - 1) % 6) // 2
+                    limit_direction = ((constraint_type - 1) % 2) # 0: lower, 1: upper
+                    constraints_by_type['limits'].append((limit_variable, limit_component, limit_direction, robj.u))
+
+                elif reference_type == REFTYPE_BYTECODE: # custom bytecode evaluation
+                    # currently unimplemented, requires parsing bytecode
+                    print('Bytecode expression constraints are not implemented!')
+                    constraints_by_type['expressions'].append(robj)
+                elif reference_type == REFTYPE_IKHINT: # IK parameters
+                    if not (hsd_joint.flags & hsd.JOBJ_TYPE_MASK == hsd.JOBJ_JOINT1):
+                        print('IK parameter constraint on bone without IK flags!')
+                else:
+                    # unknown / invalid
+                    print(f'Invalid constraint type {reference_type}!')
+                
+                # add constrain modifiers
+                if len(constraints_by_type['copy_pos']) > 0:
+                    weight = 1 / len(constraints_by_type['copy_pos'])
+                    for robj in constraints_by_type['copy_pos']:
+                        c = armature.pose.bones[hsd_joint.temp_name].constraints.new(type = 'COPY_LOCATION')
+                        c.influence = weight
+                        c.target = armature
+                        c.subtarget = robj.u.temp_name
+
+                    print(f'USING COPY_LOCATION CONSTRAINT WITH TARGET {robj.u.temp_name}!')
+                
+                if constraints_by_type['dirup_x']:
+                    robj = constraints_by_type['dirup_x']
+                    c = armature.pose.bones[hsd_joint.temp_name].constraints.new(type = 'TRACK_TO')
+                    c.target = armature
+                    c.subtarget = robj.u.temp_name
+                    c.track_axis = 'X'
+                    c.up_axis = 'Z'
+
+                    print(f'USING TRACK_TO CONSTRAINT WITH TARGET {robj.u.temp_name}!')
+
+                    # blender doesn't allow a pole orientation unless we're using the IK modifier
+                    # however te IK modifier assumes tracking in UP direction, not X
+                    # so adding the dirup_y would require changing coordinate system for all bones
+                    
+                if constraints_by_type['orientation']:
+                    robj = constraints_by_type['orientation']
+                    c = armature.pose.bones[hsd_joint.temp_name].constraints.new(type = 'COPY_ROTATION')
+                    c.target = armature
+                    c.subtarget = robj.u.temp_name
+                    if hsd_joint.flags & 8:
+                        c.owner_space = 'LOCAL'
+                        c.target_space = 'LOCAL'
+                    
+                    print(f'USING COPY_ROTATION CONSTRAINT WITH TARGET {robj.u.temp_name}!')
+
+                for limit in constraints_by_type['limits']:
+                    limit_type = {'pos' : 'LIMIT_LOCATION', 'rot' : 'LIMIT_ROTATION'}[limit[0]]
+                    existing_constraint = None
+                    for cnst in armature.pose.bones[hsd_joint.temp_name].constraints:
+                        if cnst.type == limit_type:
+                            existing_constraint = cnst
+                    if not existing_constraint:
+                        c = armature.pose.bones[hsd_joint.temp_name].constraints.new(type = limit_type)
+                        c.owner_space = 'LOCAL_WITH_PARENT'
+                        existing_constraint = c
+
+                    print(f"USING {limit_type} CONSTRAINT ON AXIS {['x', 'y', 'z'][limit[1]]}!")
+
+                    limit_text = f"{['max', 'min'][limit[2]]}_{['x', 'y', 'z'][limit[1]]}"
+                    enable_text = 'use_' + limit_text
+                    if getattr(existing_constraint, enable_text):
+                        val = getattr(existing_constraint, limit_text)
+                        if limit[2] == 0:
+                            val = max(val, limit[3])
+                        else:
+                            val = min(val, limit[3])
+                        setattr(existing_constraint, limit_text, val)
+                    else:
+                        setattr(existing_constraint, enable_text, True)
+                        setattr(existing_constraint, limit_text, limit[3])
+
+                robj = robj.next    
 
 def correct_coordinate_orientation(obj):
     #correct orientation due to coordinate system differences
@@ -2951,8 +3115,13 @@ def create_bone_rec(arm_data, hsd_bone, parent, hsd_parent, copy):
 
     bone_count += 1
     bone = arm_data.edit_bones.new(name = name)
-    if ikhack:
-        bone.tail = Vector((0.0, 1e-3, 0.0))
+    if ikhack and (hsd_bone.flags & hsd.JOBJ_TYPE_MASK == hsd.JOBJ_EFFECTOR):
+        # blender's IK system solves for the tail position, whereas the game solves for the head
+        # unchecking 'Use Tail' does not work, as that actually makes it solve for the tail of the parent, instead of its own head
+        # these are only equivalent when the bones are connected (head is equal to tail of parent)
+        # here we move the head and tail close together to get similar results
+        # if the bone becomes too small, it is pruned by blender when exiting edit mode, so that has to be accounted for
+        bone.tail = Vector((0.0, 1e-3 / hsd_bone.scale[1], 0.0))
     else:
         bone.tail = Vector((0.0, 1.0, 0.0))
     scale_x = Matrix.Scale(hsd_bone.scale[0], 4, [1.0,0.0,0.0])
