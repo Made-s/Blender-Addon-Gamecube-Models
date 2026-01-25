@@ -946,10 +946,12 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
             #technically there is an inaccuracy with this since the game engine ensures that specular maps are evaluated last
             #this only has potential effects on the alpha channel, but I haven't seen a specular map use alpha yet
             if (texdesc.flag & hsd.TEX_LIGHTMAP_MASK) & (hsd.TEX_LIGHTMAP_DIFFUSE | hsd.TEX_LIGHTMAP_AMBIENT | hsd.TEX_LIGHTMAP_SPECULAR | hsd.TEX_LIGHTMAP_EXT):
+                print(f'material: {mat.name} lightmap: {texdesc.flag & hsd.TEX_LIGHTMAP_MASK:8X}')
                 if texdesc.flag & hsd.TEX_LIGHTMAP_SPECULAR and not mobj.rendermode & hsd.RENDER_SPECULAR:
-                    print('skippig specular lightmap')
-                    continue
+                    print('skipping specular lightmap')
+                    # continue
                 colormap = texdesc.flag & hsd.TEX_COLORMAP_MASK
+                print(f'material: {mat.name} colormap: {colormap:8X}')
                 if not (colormap == hsd.TEX_COLORMAP_NONE or
                         colormap == hsd.TEX_COLORMAP_PASS):
                     mix = nodes.new('ShaderNodeMixRGB')
@@ -970,9 +972,9 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
                     mix.name = colormap_name_dict[colormap] + ' ' + str(texdesc.blending)
                     ###
                     if not colormap == hsd.TEX_COLORMAP_REPLACE:
-                        if texdesc.flag & hsd.TEX_LIGHTMAP_SPECULAR:
+                        if texdesc.flag & hsd.TEX_LIGHTMAP_SPECULAR and mobj.rendermode & hsd.RENDER_SPECULAR:
                             links.new(last_specular, mix.inputs[1])
-                        else:
+                        if texdesc.flag & (hsd.TEX_LIGHTMAP_DIFFUSE | hsd.TEX_LIGHTMAP_AMBIENT | hsd.TEX_LIGHTMAP_EXT):
                             links.new(last_color, mix.inputs[1])
                         links.new(cur_color, mix.inputs[2])
                     if colormap == hsd.TEX_COLORMAP_ALPHA_MASK:
@@ -984,9 +986,9 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
                     elif colormap == hsd.TEX_COLORMAP_REPLACE:
                         links.new(cur_color, mix.inputs[1])
                         mix.inputs[0].default_value = 0.0
-                    if texdesc.flag & hsd.TEX_LIGHTMAP_SPECULAR:
+                    if texdesc.flag & hsd.TEX_LIGHTMAP_SPECULAR and mobj.rendermode & hsd.RENDER_SPECULAR:
                         last_specular = mix.outputs[0]
-                    else:
+                    if texdesc.flag & (hsd.TEX_LIGHTMAP_DIFFUSE | hsd.TEX_LIGHTMAP_AMBIENT | hsd.TEX_LIGHTMAP_EXT):
                         last_color = mix.outputs[0]
                 #do alpha
                 alphamap = texdesc.flag & hsd.TEX_ALPHAMAP_MASK
@@ -1032,8 +1034,8 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
             color.attribute_name = 'color_0'
             mult = nodes.new('ShaderNodeMixRGB')
             mult.blend_type = 'MULTIPLY'
-            links.new(color.outputs[0], mult.inputs[0])
-            links.new(last_color, mult.inputs[1])
+            links.new(color.outputs[0], mult.inputs[1])
+            links.new(last_color, mult.inputs[2])
             last_color = mult.outputs[0]
         
         if alpha_flags & hsd.RENDER_ALPHA_VTX:
@@ -1041,8 +1043,8 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
             cur_alpha.attribute_name = 'alpha_0'
             mult = nodes.new('ShaderNodeMixRGB')
             mult.blend_type = 'MULTIPLY'
-            links.new(cur_alpha.outputs[0], mult.inputs[0])
-            links.new(last_alpha, mult.inputs[1])
+            links.new(cur_alpha.outputs[0], mult.inputs[1])
+            links.new(last_alpha, mult.inputs[2])
             last_alpha = mult.outputs[0]
 
     #final render settings, on the GameCube these would control how the rendered data is written to the EFB (Embedded Frame Buffer)
