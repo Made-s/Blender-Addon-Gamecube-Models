@@ -710,6 +710,7 @@ def init_geometry():
             mat = material_dict[hsd_mesh.mobj.id]
             ob.data.materials.append(mat)
             pobj = pobj.next
+
     return mesh_dict, material_dict
 
 #normalize u8 to float
@@ -825,6 +826,11 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
             #else:
             color = nodes.new('ShaderNodeAttribute')
             color.attribute_name = 'color_0'
+            # approximate srgb -> linear conversion for vertex colors
+            gamma = nodes.new('ShaderNodeGamma')
+            gamma.inputs[1].default_value = 1 / 2.2
+            links.new(color.outputs[0], gamma.inputs[0])
+            color = gamma
 
             if not (diffuse_flags == hsd.RENDER_DIFFUSE_VTX):
                 diff = nodes.new('ShaderNodeRGB')
@@ -881,8 +887,11 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
         mapping.inputs[2].default_value = texdesc.rotate #mapping.rotate[:]
         mapping.inputs[3].default_value = texdesc.scale #mapping.scale[:]
 
+        mapping.inputs[3].default_value[0] /= texdesc.repeat_s
+        mapping.inputs[3].default_value[1] /= texdesc.repeat_t
+
         #blender UV coordinates are relative to the bottom left so we need to account for that
-        mapping.inputs[1].default_value[1] = 1 - (texdesc.scale[1] * (texdesc.translate[1] + 1))
+        mapping.inputs[1].default_value[1] = (1. - texdesc.scale[1] * texdesc.repeat_t) - mapping.inputs[1].default_value[1]
 
         #TODO: Is this correct?
         if (texdesc.flag & hsd.TEX_COORD_MASK) == hsd.TEX_COORD_REFLECTION:
@@ -896,7 +905,8 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
         texture.name += (' tlut: 0x%X' % (texdesc.tlutdesc.id if texdesc.tlutdesc else -1))
 
         texture.extension = 'EXTEND'
-        if texdesc.wrap_t == gx.GX_REPEAT:
+        # blender does not allow direction dependent wrapping, so we give it priority in both directions
+        if texdesc.wrap_t == gx.GX_REPEAT or texdesc.wrap_s == gx.GX_REPEAT:
             texture.extension = 'REPEAT'
 
         interp_dict = {
@@ -956,7 +966,7 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
                         colormap == hsd.TEX_COLORMAP_PASS):
                     mix = nodes.new('ShaderNodeMixRGB')
                     mix.blend_type = map_col_op_dict[colormap]
-                    mix.inputs[0].default_value = 1
+                    mix.inputs[0].default_value = 1.
                     ###
                     colormap_name_dict = {
                     hsd.TEX_COLORMAP_NONE: 'TEX_COLORMAP_NONE',
@@ -1030,11 +1040,16 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
             
         #else:
         if diffuse_flags & hsd.RENDER_DIFFUSE_VTX:
+            # approximate srgb -> linear conversion for vertex colors
+            gamma = nodes.new('ShaderNodeGamma')
+            gamma.inputs[1].default_value = 1 / 2.2
             color = nodes.new('ShaderNodeAttribute')
             color.attribute_name = 'color_0'
             mult = nodes.new('ShaderNodeMixRGB')
+            mult.inputs[0].default_value = 1
             mult.blend_type = 'MULTIPLY'
-            links.new(color.outputs[0], mult.inputs[1])
+            links.new(color.outputs[0], gamma.inputs[0])
+            links.new(gamma.outputs[0], mult.inputs[1])
             links.new(last_color, mult.inputs[2])
             last_color = mult.outputs[0]
         
@@ -1042,6 +1057,7 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
             cur_alpha = nodes.new('ShaderNodeAttribute')
             cur_alpha.attribute_name = 'alpha_0'
             mult = nodes.new('ShaderNodeMixRGB')
+            mult.inputs[0].default_value = 1
             mult.blend_type = 'MULTIPLY'
             links.new(cur_alpha.outputs[0], mult.inputs[1])
             links.new(last_alpha, mult.inputs[2])
@@ -1210,26 +1226,38 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
     #roughness
     shader.inputs["Roughness"].default_value = .5
 
-    #diffuse color
-    links.new(last_color, shader.inputs["Base Color"])
-
-    #alpha
-    if transparent_shader:
-        #
-        #alpha_factor = nodes.new('ShaderNodeMath')
-        #alpha_factor.operation = 'POWER'
-        #alpha_factor.inputs[1].default_value = 3
-        #links.new(last_alpha, alpha_factor.inputs[0])
-        #last_alpha = alpha_factor.outputs[0]
-        #
-        links.new(last_alpha, shader.inputs["Alpha"])
-
     #normal
     if last_bump:
         bump = nodes.new('ShaderNodeBump')
         bump.inputs[1].default_value = 1
         links.new(last_bump, bump.inputs[2])
         links.new(bump.outputs[0], shader.inputs["Normal"])
+
+    #diffuse color
+    if mobj.rendermode & hsd.RENDER_DIFFUSE:
+        links.new(last_color, shader.inputs["Base Color"])
+        #alpha
+        if transparent_shader:
+            links.new(last_alpha, shader.inputs["Alpha"])
+    else:
+        # no diffuse lighting
+        shader.inputs["Base Color"].default_value = [0, 0, 0, 1]
+        emission = nodes.new('ShaderNodeEmission')
+        links.new(last_color, emission.inputs["Color"])
+        diffuse = emission
+        #alpha
+        if transparent_shader:
+            mixshader = nodes.new('ShaderNodeMixShader')
+            transparent = nodes.new('ShaderNodeBsdfTransparent')
+            links.new(last_alpha, mixshader.inputs[0])
+            links.new(transparent.outputs[0], mixshader.inputs[1])
+            links.new(diffuse.outputs[0], mixshader.inputs[2])
+            diffuse = mixshader
+        
+        addshader = nodes.new('ShaderNodeAddShader')
+        links.new(diffuse.outputs[0], addshader.inputs[0])
+        links.new(shader.outputs[0], addshader.inputs[1])
+        shader = addshader
 
     #Add Additive or multiplicative alpha blending, since these don't have explicit options in 2.81 anymore
     if (alt_blend_mode == 'ADD'):
@@ -1858,7 +1886,7 @@ def add_contraints(armature, bones):
                 position = Vector(joint1.parent.matrix_local.translation)
                 direction = Vector(joint1.parent.matrix_local.col[0][0:3]).normalized()
                 bone_length = joint2_length_robj.val0
-                direction *= bone_length * joint1.parent.matrix_local.to_scale()[0]
+                direction *= bone_length * pole_data_joint.temp_matrix.to_scale()[0]
                 position += direction
                 
                 headpos = Vector(armature.data.edit_bones[joint1_name].head[:]) + (position - joint1_pos)
@@ -1876,7 +1904,7 @@ def add_contraints(armature, bones):
             position = Vector(effector.parent.matrix_local.translation)
             direction = Vector(effector.parent.matrix_local.col[0][0:3]).normalized()
             bone_length = effector_length_robj.val0
-            direction *= bone_length * effector.parent.matrix_local.to_scale()[0]
+            direction *= bone_length * hsd_joint.temp_parent.temp_matrix.to_scale()[0]
             position += direction
             
             #XXX contrary to documentation, .translate() doesn't seem to exist on EditBones in 2.81
@@ -1989,8 +2017,8 @@ def add_contraints(armature, bones):
                     c = armature.pose.bones[hsd_joint.temp_name].constraints.new(type = 'TRACK_TO')
                     c.target = armature
                     c.subtarget = robj.u.temp_name
-                    c.track_axis = 'X'
-                    c.up_axis = 'Z'
+                    c.track_axis = 'TRACK_X'
+                    c.up_axis = 'UP_Z'
 
                     print(f'USING TRACK_TO CONSTRAINT WITH TARGET {robj.u.temp_name}!')
 
