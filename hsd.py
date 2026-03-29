@@ -496,7 +496,9 @@ _HSD_FORMATS = {
     'HSD_FogDesc':                  ('I', 'I', 'f', 'f', '4B'),
     #'Particle': #placeholder        ('I'),
     'HSD_RenderDesc':               ('I', 'I', 'I'),
-    #'HSD_RenderAnim':               ('I'),
+    'HSD_RenderAnim':               ('I', 'I'),
+    'HSD_ChanAnim':                 ('I', 'I'),
+    'HSD_TevRegAnim':               ('I', 'I'),
     'HSD_RObjAnim':                 ('I'),
     'HSD_RObj':                     ('I', 'I', 'I'),
     #'HSD_FogAdjDesc':               ('I'),
@@ -545,14 +547,16 @@ _HSD_COMPONENTS = {
     'HSD_AnimJoint':                'child next aobjdesc robjanim flags',
     'HSD_MatAnimJoint':             'child next matanim',
     'HSD_MatAnim':                  'next aobjdesc texanim renderanim',
-    'HSD_TexAnim':                  'next id aobjdesc imagetbl tluttbl nb_imagetbl nb_tluttbl',
+    'HSD_TexAnim':                  'next texid aobjdesc imagetbl tluttbl nb_imagetbl nb_tluttbl',
     'HSD_ShapeAnimJoint':           'child next shapeanim',
     'HSD_ShapeAnimDObj':            'next shapeanim',
     'HSD_ShapeAnim':                'next aobjdesc',
     'HSD_FogDesc':                  'type adjdesc startz endz color',
     #'Particle':                     'placeholder',
     'HSD_RenderDesc':               'toontobjdesc gradtobjdesc terminator',
-    #'HSD_RenderAnim':               'placeholder',
+    'HSD_RenderAnim':               'chananim reganim',
+    'HSD_ChanAnim':                 'next aobjdesc',
+    'HSD_TevRegAnim':               'next aobjdesc',
     'HSD_RObjAnim':                 'placeholder',
     'HSD_RObj':                     'next flags u',
     #'HSD_FogAdjDesc':               'placeholder',
@@ -1455,7 +1459,43 @@ def HSD_init_RenderDesc(data, offset):
 
 @offset_check
 def HSD_init_RenderAnim(data, offset):
-    return None, True #TODO:
+    renderanim, old = HSD_read_struct('HSD_RenderAnim', data, offset)
+    if old:
+        return matanim, True
+    renderanim.chananim, valid = HSD_init_ChanAnim(data, renderanim.chananim)
+    if not valid:
+        return None, False
+    renderanim.reganim, valid = HSD_init_TevRegAnim(data, renderanim.reganim)
+    if not valid:
+        return None, False
+    return renderanim, True
+
+@offset_check
+def HSD_init_ChanAnim(data, offset):
+    chananim, old = HSD_read_struct('HSD_ChanAnim', data, offset)
+    if old:
+        return matanim, True
+    chananim.next, valid = HSD_init_ChanAnim(data, chananim.next)
+    if not valid:
+        return None, False
+    chananim.aobjdesc, valid = HSD_init_AObjDesc(data, chananim.aobjdesc)
+    if not valid:
+        return None, False
+    return chananim, True
+
+@offset_check
+def HSD_init_TevRegAnim(data, offset):
+    reganim, old = HSD_read_struct('HSD_TevRegAnim', data, offset)
+    if old:
+        return matanim, True
+    reganim.next, valid = HSD_init_TevRegAnim(data, reganim.next)
+    if not valid:
+        return None, False
+    reganim.aobjdesc, valid = HSD_init_AObjDesc(data, reganim.aobjdesc)
+    if not valid:
+        return None, False
+    return reganim, True
+
 
 @offset_check
 def HSD_init_RObjAnim(data, offset):

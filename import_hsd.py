@@ -173,7 +173,7 @@ def load_hsd(filepath, context = None, offset = 0, scene_name = 'scene_data', da
 
 def load_bone(data, info, rel, filepath):
     root_joint, valid = hsd.HSD_init_Joint(data, info.entry)
-    mesh_dict, material_dict, spline_dict = init_geometry()
+    mesh_dict, material_dict, spline_dict, image_dict = init_geometry()
     if valid:
         armature = load_model(root_joint, mesh_dict, material_dict)
     else:
@@ -188,7 +188,8 @@ def load_scene(data, scene_info, rel, filepath, import_animation = True):
     scene = list(scenedescs.values())[0]
 
     #do geometry here because the way it's currently implemented it initializes geometry from all models
-    mesh_dict, material_dict, spline_dict = init_geometry()
+    dicts = init_geometry()
+    mesh_dict, material_dict, spline_dict, image_dict = dicts
 
     for k, modelset in enumerate(scene.modelsets):
         root_joint = modelset.joint
@@ -209,28 +210,50 @@ def load_scene(data, scene_info, rel, filepath, import_animation = True):
 
             for i in range(anim_count):
 
-                if modelset.animjoints:
+                global cur_anim
 
-                    global cur_anim
+                if bpy.app.version >= BlenderVersion(4, 4, 0):
+                    # blender 4.4+ introduces slotted actions, which makes it possible to easily link stuff like material animations to the same actions as armature ones
+                    # for now, this will be the only supported way to import the former and only armature animations are supported on lower versions
+                    cur_anim = i
+
+                    # Note to users (and future me):
+                    # to swap between actions on all animated targets of that action in the user interface, use "Replace Action" in the Action menu in the Action Editor with the relevant action selected
+                    # this was only added in Blender 5.1, and so switching these between 4.4 - 5.0 is somewhat of a pain
+                    # The way to do this in 4.4 - 5.0 is to go into the Outliner, select the "Blender File" display mode, right click the relevant action and use the "Remap Users" operation
+                    # these two approaches are not exactly equivalent, check the blender documentation for their differences
+
+                    action = create_action(os.path.basename(filepath) + '_Anim' + '' + ' ' + str(k) + ' ' + str(i))
+
+                    boneanimjoint  = None
+                    matanimjoint   = None
+                    shapeanimjoint = None
+
+                    # only bother adding anything if it's not empty
+                    if modelset.animjoints:
+                        animjoint = modelset.animjoints[i]
+                        if animjoint.aobjdesc or animjoint.child or animjoint.next:
+                            boneanimjoint = animjoint
+
+                    if modelset.matanimjoints:
+                        animjoint = modelset.matanimjoints[i]
+                        if animjoint.matanim or animjoint.child or animjoint.next:
+                            matanimjoint = animjoint
+
+                    if modelset.shapeanimjoints:
+                        animjoint = modelset.shapeanimjoints[i]
+                        if animjoint.shapeanim or animjoint.child or animjoint.next:
+                            shapeanimjoint = animjoint
+
+                    add_hierarchy_animations(armature, root_joint, boneanimjoint, matanimjoint, shapeanimjoint, action, dicts)
+
+                elif modelset.animjoints:
+                    # use old action system
                     cur_anim = i
                     animjoint = modelset.animjoints[i]
                     if animjoint.aobjdesc or animjoint.child or animjoint.next:
-                        action = bpy.data.actions.new(os.path.basename(filepath) + '_Anim' + '' + ' ' + str(k) + ' ' + str(i))
-                        action.use_fake_user = True
-                        # support slotted actions
-                        if bpy.app.version >= BlenderVersion(4, 5, 0):
-                            # for now this just makes a basic object slot
-                            # later on this should have separate slots for different objects, armatures, materials, etc.
-                            action.slots.new('OBJECT', 'Armature')
-                            action.slots.active = action.slots[0]
-
-                        bpy.types.PoseBone.custom_40 = bpy.props.FloatProperty(name="40")
-                        add_bone_animation_total(armature, root_joint, modelset.animjoints[i], action)
-                #TODO: figure out how to pack this into a single track with the above or something
-                #if modelset.matanimjoints:
-                #    add_material_animation(material_dict, modelset.matanimjoints[i], action)
-                #if modelset.shapeanimjoints:
-                #    add_shape_animation(mesh_dict, modelset.shapeanimjoints[i], action)
+                        action = create_action(os.path.basename(filepath) + '_Anim' + '' + ' ' + str(k) + ' ' + str(i))
+                        add_hierarchy_animations(armature, root_joint, animjoint, None, None, action, None)    
 
     for lightset in scene.lightsets:
         light = lightset.lightdesc
@@ -242,24 +265,77 @@ def load_scene(data, scene_info, rel, filepath, import_animation = True):
 
 cur_anim = 0
 
+# the action API has breaking changes between 4.5 and 5.0, introducing layers, strips and slots
+# these changes are already available from 4.4 onwards, so we'll use them there too for the slots
+def create_action(name):
+    action = bpy.data.actions.new(name)
+    # make sure blender doesn't delete this if it's not assigned to anything
+    action.use_fake_user = True
+    if bpy.app.version >= BlenderVersion(4, 4, 0):
+        # blender currently only supports a single layer with a single strip anyway
+        layer = action.layers.new("Layer")
+        strip = action.layers[0].strips.new(type='KEYFRAME')
+    return action
+
+def assign_action(obj, action, slot = None):
+    obj.animation_data_create()
+    obj.animation_data.action = action
+    if bpy.app.version >= BlenderVersion(4, 4, 0):
+        obj.animation_data.action_slot = slot
+
+def add_fcurve(action, slot, path, index = None):
+    if bpy.app.version < BlenderVersion(4, 4, 0):
+        fcurves = action.fcurves
+    else:
+        if not slot:
+            slot = action.slots[0]
+        # get the one existing strip
+        strip = action.layers[0].strips[0]
+        fcurves = strip.channelbag(slot, ensure=True).fcurves
+
+    if index:
+        return fcurves.new(path, index = index)
+    else:
+        return fcurves.new(path)
+
+def remove_fcurve(action, slot, curve):
+    if bpy.app.version < BlenderVersion(4, 4, 0):
+        fcurves = action.fcurves
+    else:
+        if not slot:
+            slot = action.slots[0]
+        # get the one existing strip
+        strip = action.layers[0].strips[0]
+        fcurves = strip.channelbag(slot).fcurves
+
+    return fcurves.remove(curve)
+    
 
 #####################################
 
-
-
-
-def add_bone_animation_total(armature, root_joint, animation, action):
+def add_hierarchy_animations(armature, root_joint, boneanim, matanim, shapeanim, action, dicts):
     for bone in armature.pose.bones:
         bone.rotation_mode = 'XYZ'
     for bone in armature.data.bones:
         bone.use_local_location = True
-    armature.animation_data_create()
-    armature.animation_data.action = action
-    if bpy.app.version >= BlenderVersion(4, 4, 0):
-        armature.animation_data.action_slot = action.slots[0]
-    trav_animjoints_total(root_joint, animation, action, armature)
 
-def trav_animjoints_total(joint, animjoint, action, armature):
+    # we only have one armature 
+    # (this may change when we switch to making generic hierarchies that contain possibly multiple (or no) armatures)
+    if bpy.app.version >= BlenderVersion(4, 4, 0):
+        # bone animation data seems to be of object type and assigned to the armature object rather than the armature data block
+        # I'm guessing the armature data block is reserved for armature properties
+        # It's possible that this choice allows separate bone animations for instances of the same armature
+        object_slot = action.slots.new('OBJECT', 'Armature Animation')
+        # action.slots.new('ARMATURE', 'Armature')
+        # action.slots.active = action.slots[0]
+
+        assign_action(armature, action, object_slot)
+    else:
+        assign_action(armature, action)
+
+    traverse_animation_hierarchy(root_joint, boneanim, matanim, shapeanim, action, armature, dicts)
+
+def traverse_animation_hierarchy(joint, boneanimjoint, matanimjoint, shapeanimjoint, action, armature, dicts, depth = 0):
 
     if joint.robj:
         robj = joint.robj
@@ -278,15 +354,67 @@ def trav_animjoints_total(joint, animjoint, action, armature):
             elif (robj.flags & 0x70000000 == 0x40000000): # bone length and pole angle
                 print(' VAL0: %f VAL1: %f' % (robj.val0, robj.val1))
             robj = robj.next
-        if animjoint.robjanim:
+        if boneanimjoint and boneanimjoint.robjanim:
             print('ROBJANIM')
 
-    if animjoint.aobjdesc:
-        add_jointanim_to_armature_total(joint, animjoint, action, armature)
-    if animjoint.child:
-        trav_animjoints_total(joint.child, animjoint.child, action, armature)
-    if animjoint.next:
-        trav_animjoints_total(joint.next, animjoint.next, action, armature)
+    if boneanimjoint and boneanimjoint.aobjdesc:
+        add_joint_animation(joint, boneanimjoint, action, armature)
+
+    if (matanimjoint and matanimjoint.matanim) or (shapeanimjoint and shapeanimjoint.shapeanim):
+        # do we have a mesh here ?
+        if joint.u and not joint.flags & (hsd.JOBJ_PTCL | hsd.JOBJ_SPLINE):
+            mesh_dict = dicts[0]
+            material_dict = dicts[1]
+            image_dict = dicts[3]
+            dobj = joint.u
+            if matanimjoint and matanimjoint.matanim:
+                matanim = matanimjoint.matanim
+            else:
+                matanim = None
+            if shapeanimjoint and shapeanimjoint.shapeanim:
+                shapeanimdobj = shapeanimjoint.shapeanim
+            else:
+                shapeanimdobj = None
+            while dobj:
+                # there are multiple pobj objects per dobj, but only one mobj, because the pobjs are split portions of the same mesh with one material
+                # TODO: work on adding an option to merge split meshes, this would have to be considered here
+                if matanim:
+                    mobj = dobj.mobj
+                    add_material_animation(material_dict[mobj.id], mobj, matanim, action, image_dict)
+                if shapeanimdobj:
+                    pobj = dobj.pobj
+                    shapeanim = shapeanimdobj.shapeanim
+                    while pobj and shapeanim:
+                        add_shape_animation(mesh_dict[pobj.id], pobj, shapeanim, action)
+                        pobj = pobj.next
+                        shapeanim = shapeanim.next
+                dobj = dobj.next
+                if matanim:
+                    matanim = matanim.next
+                if shapeanimdobj:
+                    shapeanimdobj = shapeanimdobj.next
+        else:
+            print('Material or Shape anim on non-mesh bone!!!')
+    
+    if joint.child:
+        children = [None] * 3
+        has_animation = False
+        for i, animjoint in enumerate([boneanimjoint, matanimjoint, shapeanimjoint]):
+            if animjoint and animjoint.child:
+                children[i] = animjoint.child
+                has_animation = True
+        if has_animation:
+            traverse_animation_hierarchy(joint.child, *children, action, armature, dicts, depth + 1)
+    
+    if joint.next:
+        nexts = [None] * 3
+        has_animation = False
+        for i, animjoint in enumerate([boneanimjoint, matanimjoint, shapeanimjoint]):
+            if animjoint and animjoint.next:
+                nexts[i] = animjoint.next
+                has_animation = True
+        if has_animation:
+            traverse_animation_hierarchy(joint.next, *nexts, action, armature, dicts, depth + 1)
 
 
 TRANSFORMCOUNT = (hsd.HSD_A_J_SCAZ - hsd.HSD_A_J_ROTX) + 1
@@ -304,9 +432,123 @@ t_jointanim_type_dict = {
     hsd.HSD_A_J_SCAZ: ('s', 2),
 }
 
+def add_material_animation(material, mobj, matanim, action, image_dict):
+
+    
+    # material_slot = action.slots.new('MATERIAL', f'{material.name} - Material Settings')
+    # material.animation_data_create()
+    # material.animation_data.action = action
+    # material.animation_data.action_slot = material_slot
+
+    tree = material.node_tree
+    if matanim and (matanim.aobjdesc or matanim.texanim):
+        shader_slot = action.slots.new('NODETREE', f'{material.name} - Shader Tree')
+        assign_action(tree, action, shader_slot)
+
+        materialanim = matanim.aobjdesc
+        if materialanim:
+            diffuse  = mobj.animation_references.diffuse
+            alpha    = mobj.animation_references.alpha
+            specular = mobj.animation_references.specular
+
+        # this will need some coordination with the shader code ...
+        texanim = matanim.texanim
+        while texanim:
+            if texanim.aobjdesc and not (texanim.aobjdesc.flags & hsd.AOBJ_NO_ANIM):
+                aobjdesc = texanim.aobjdesc
+                mapping, texture, mix, tev = mobj.animation_references.texture_nodes[texanim.texid]
+
+                texdesc = mobj.texdesc
+                while texdesc:
+                    if texdesc.texid == texanim.texid:
+                        break
+                    texdesc = texdesc.next
+                if not texdesc or not texture:
+                    print('Could not find the texture corresponding to a texture animation!')
+
+                fobj = aobjdesc.fobjdesc
+
+                uv_curves = {}
+
+                while fobj:
+                    if fobj.type == hsd.HSD_A_T_TIMG or fobj.type == hsd.HSD_A_T_TCLT:
+                        # image and palette tables are not supported as the choice of image used for an image texture node is not animatable
+                        # this may be doable in some roundabout way but for now it's not implemented
+                        pass
+                    elif fobj.type >= hsd.HSD_A_T_TRAU or fobj.type <= hsd.HSD_A_T_ROTZ:
+                        # TODO: implemented linearly combining curves
+                        if fobj.type < hsd.HSD_A_T_ROTX:
+                            input = ["Location", "Scale"][(fobj.type - hsd.HSD_A_T_TRAU) // 2]
+                            component = (fobj.type - hsd.HSD_A_T_TRAU) % 2
+                        else:
+                            input = "Rotation"
+                            component = fobj.type - hsd.HSD_A_T_ROTX
+                       
+                        data_path = f'nodes["{mapping.name}"].inputs["{input}"].default_value'
+                        curve = add_fcurve(action, shader_slot, data_path, index = component)
+
+                        uv_curves[input + str(component)] = curve
+
+                        curve_bias = 0
+                        curve_scale = 1
+                        read_fobjdesc(fobj, curve, curve_bias, curve_scale, False, False)
+
+                        if aobjdesc.flags & hsd.AOBJ_ANIM_LOOP:
+                            curve.modifiers.new('CYCLES')
+                        
+                    elif fobj.type == hsd.HSD_A_T_BLEND or fobj.type == hsd.HSD_A_T_TS_BLEND:
+                        pass
+                    elif fobj.type >= hsd.HSD_A_T_KONST_R and fobj.type <= hsd.HSD_A_T_KONST_A:
+                        pass
+                    elif fobj.type >= hsd.HSD_A_T_TEV0_R and fobj.type <= hsd.HSD_A_T_TEV1_A:
+                        pass
+                    elif fobj.type == hsd.HSD_A_T_LOD_BIAS:
+                        pass
+                    else:
+                        print('Unknown texture animation type: %.2X' % fobj.type)
+                        
+                    fobj = fobj.next
+
+                # convert UVs to blender convention
+                # potentially need an extra curve
+                if "Scale1" in uv_curves and not "Location1" in uv_curves:
+                    data_path = f'nodes["{mapping.name}"].inputs["Location"].default_value'
+                    location1_curve = add_fcurve(action, shader_slot, data_path, index = 1)
+                else:
+                    location1_curve = None
+                curves_to_blender_uvs(uv_curves, texdesc, location1_curve)
+
+            texanim = texanim.next
 
 
-def add_jointanim_to_armature_total(joint, animjoint, action, armature):
+    
+    # example data path:
+    # f'nodes["{node.name}"].inputs[1].default_value'
+
+
+    # bpy.data.images["imported_image_GX_TF_CMPR.076"].name
+    # matanim: aobjdesc texanim renderanim
+    # matanim parameters: ambient RGB, diffuse RGB, alpha, specular RGB, PE ref0, ref1, dstalpha
+    # texanim: tex_id aobjdesc imagetbl tluttbl nb_imagetbl nb_tluttbl
+    # texanim parameters: image (n), palette (n), blend factor, rot, trans, scale, LOD bias, konst, tev0 RGBA, tev1 RGBA, (blending again)
+    # renderanim: chananim reganim
+
+    pass
+
+def add_shape_animation(mesh, pobj, animation, action):
+
+    mesh_slot = action.slots.new('MESH', f'{mesh.name} - ShapeAnim')
+    assign_action(mesh.data, action, mesh_slot)
+
+    # shapeanim: aobjdesc
+
+    pass
+
+
+
+
+
+def add_joint_animation(joint, animjoint, action, armature):
     pose = armature.pose
 
     aobjdesc = animjoint.aobjdesc
@@ -325,6 +567,11 @@ def add_jointanim_to_armature_total(joint, animjoint, action, armature):
             path_constr = constr
             uses_path = True
             break
+
+    if bpy.app.version >= BlenderVersion(4, 4, 0):
+        slot = armature.animation_data.action_slot
+    else:
+        slot = None
     
     transform_list = [0] * (TRANSFORMCOUNT)
     while fobj:
@@ -357,7 +604,7 @@ def add_jointanim_to_armature_total(joint, animjoint, action, armature):
                     setattr(constr, 'min_' + c, 0.)
                     setattr(constr, 'max_' + c, 0.)
 
-            curve = action.fcurves.new('pose.bones["' + joint.temp_name + '"].constraints["' + path_constr.name + '"].offset')
+            curve = add_fcurve(action, slot, 'pose.bones["' + joint.temp_name + '"].constraints["' + path_constr.name + '"].offset')
 
             curve_bias = 0
             curve_scale = -path_obj.data.path_duration
@@ -367,10 +614,9 @@ def add_jointanim_to_armature_total(joint, animjoint, action, armature):
         elif fobj.type >= hsd.HSD_A_J_ROTX and fobj.type <= hsd.HSD_A_J_SCAZ:
             data_type, component = t_jointanim_type_dict[fobj.type]
             data_path = 'pose.bones["' + joint.temp_name + '"]' + '.' + data_type
-            curve = action.fcurves.new(data_path, index=component)
+            curve = add_fcurve(action, slot, data_path, index=component)
             transform_list[fobj.type - hsd.HSD_A_J_ROTX] = curve
 
-            #
             curve_bias = 0
             curve_scale = 1
             read_fobjdesc(fobj, curve, curve_bias, curve_scale, False, False)
@@ -384,26 +630,26 @@ def add_jointanim_to_armature_total(joint, animjoint, action, armature):
 
     for i in range(3):
         if not transform_list[i]:
-            curve = action.fcurves.new('pose.bones["' + joint.temp_name + '"].r', index=i)
+            curve = add_fcurve(action, slot, 'pose.bones["' + joint.temp_name + '"].r', index=i)
             curve.keyframe_points.insert(0, joint.rotation[i])
             transform_list[i] = curve
         if not transform_list[i+4]:
-            curve = action.fcurves.new('pose.bones["' + joint.temp_name + '"].l', index=i)
+            curve = add_fcurve(action, slot, 'pose.bones["' + joint.temp_name + '"].l', index=i)
             curve.keyframe_points.insert(0, joint.position[i])
             transform_list[i+4] = curve
         if not transform_list[i+7]:
-            curve = action.fcurves.new('pose.bones["' + joint.temp_name + '"].s', index=i)
+            curve = add_fcurve(action, slot, 'pose.bones["' + joint.temp_name + '"].s', index=i)
             curve.keyframe_points.insert(0, joint.scale[i])
             transform_list[i+7] = curve
 
     new_transform_list = [0] * 10
 
     for i in range(3):
-        curve = action.fcurves.new('pose.bones["' + joint.temp_name + '"].rotation_euler', index=i)
+        curve = add_fcurve(action, slot, 'pose.bones["' + joint.temp_name + '"].rotation_euler', index=i)
         new_transform_list[i] = curve
-        curve = action.fcurves.new('pose.bones["' + joint.temp_name + '"].location', index=i)
+        curve = add_fcurve(action, slot, 'pose.bones["' + joint.temp_name + '"].location', index=i)
         new_transform_list[i+4] = curve
-        curve = action.fcurves.new('pose.bones["' + joint.temp_name + '"].scale', index=i)
+        curve = add_fcurve(action, slot, 'pose.bones["' + joint.temp_name + '"].scale', index=i)
         new_transform_list[i+7] = curve
 
     global anim_max_frame
@@ -419,7 +665,7 @@ def add_jointanim_to_armature_total(joint, animjoint, action, armature):
         # chan_mat is the matrix based on the pose bone parameters
         # notably, the edit bone matrices lack scale, so that has to be accoutned for
         # we are trying to achieve T_edit * R_edit * T_pose * R_pose * S_pose = T * R * S
-        # we also have T_edit * R_edit = (TRS_base(b)).normalized() / (TRS_base(b-1)).normalized() := M_edit
+        # we also have T_edit * R_edit = M_edit = (TRS_base(b)).normalized() / (TRS_base(b-1)).normalized() := M_edit
         # => T_pose * R_pose * S_pose = M_edit^{-1} * (T * R * S)
         # to get the scale of the mesh to match before and after we also need to add some scale corrections
         # the scale correction for each bone then needs to be reversed after the child's edit matrix to keep the same cumulative scale
@@ -450,121 +696,10 @@ def add_jointanim_to_armature_total(joint, animjoint, action, armature):
     # clear temporary curves
     for c in transform_list:
         if c:
-            action.fcurves.remove(c)
+            remove_fcurve(action, slot, c)
 
 
 ####################################
-
-
-def add_bone_animation(armature, root_joint, animation, action):
-    for bone in armature.pose.bones:
-        bone.rotation_mode = 'XYZ'
-    for bone in armature.data.bones:
-        bone.use_local_location = False
-        #bone.use_inherit_rotation = False
-    armature.animation_data_create()
-    armature.animation_data.action = action
-    trav_animjoints(root_joint, animation, action)
-
-def trav_animjoints(joint, animjoint, action):
-    if animjoint.flags:
-        print('Joint: %s\t AnimJointFlags: %.8X' % (joint.temp_name, animjoint.flags))
-    if animjoint.aobjdesc:
-        add_jointanim_to_armature(joint, animjoint.aobjdesc, action)
-    if animjoint.child:
-        trav_animjoints(joint.child, animjoint.child, action)
-    if animjoint.next:
-        trav_animjoints(joint.next, animjoint.next, action)
-
-def add_jointanim_to_armature(joint, aobjdesc, action):
-    trans, rot, scale = joint.position, joint.rotation, joint.scale
-    #if aobjdesc.flags & hsd.AOBJ_NO_ANIM:
-    #    return
-    fobj = aobjdesc.fobjdesc
-    transform_list = [0] * 10
-    while fobj:
-        #print(hsd_a_j_dict[fobj.type])
-        if fobj.type == hsd.HSD_A_J_PATH:
-            #TODO: implement paths
-            print('------ HSD_A_J_PATH ------')
-        elif (fobj.type >= hsd.HSD_A_J_ROTX and fobj.type <= hsd.HSD_A_J_SCAZ):
-            data_type, component = jointanim_type_dict[fobj.type]
-            data_path = 'pose.bones["' + joint.temp_name + '"]' + '.' + data_type
-            curve = action.fcurves.new(data_path, index=component)
-            transform_list[fobj.type - hsd.HSD_A_J_ROTX] = curve
-
-            #HSD curves give absolute transform values while the Pose's are relative to the EditBones'
-            #This means we'll have to adjust all the values accordingly
-            curve_bias = 0
-            curve_scale = 1
-            if fobj.type == hsd.HSD_A_J_ROTX:
-                curve_bias = -rot[0]
-            elif fobj.type == hsd.HSD_A_J_ROTY:
-                curve_bias = -rot[1]
-            elif fobj.type == hsd.HSD_A_J_ROTZ:
-                curve_bias = -rot[2]
-            elif fobj.type == hsd.HSD_A_J_TRAX:
-                curve_bias = -trans[0]
-            elif fobj.type == hsd.HSD_A_J_TRAY:
-                curve_bias = -trans[1]
-            elif fobj.type == hsd.HSD_A_J_TRAZ:
-                curve_bias = -trans[2]
-            elif fobj.type == hsd.HSD_A_J_SCAX:
-                curve_scale = 1 / scale[0]
-            elif fobj.type == hsd.HSD_A_J_SCAY:
-                curve_scale = 1 / scale[1]
-            elif fobj.type == hsd.HSD_A_J_SCAZ:
-                curve_scale = 1 / scale[2]
-
-            if printd:
-                print(hsd_a_j_dict[fobj.type])
-            read_fobjdesc(fobj, curve, curve_bias, curve_scale, printd)
-            #read_fobjdesc(fobj, curve, 0, 1, printd)
-
-            if aobjdesc.flags & hsd.AOBJ_ANIM_LOOP:
-                curve.modifiers.new('CYCLES')
-        else:
-            print('Unknown A Type: %.2X' % fobj.type)
-            if fobj.type in hsd_a_j_dict:
-                data_type = hsd_a_j_dict[fobj.type]
-            else:
-                data_type = 'custom_%d' % fobj.type
-            data_path = 'pose.bones["' + joint.temp_name + '"]' + '.' + data_type
-            curve = action.fcurves.new(data_path, index=0)
-            read_fobjdesc(fobj, curve, 0, 1, printd)
-
-        fobj = fobj.next
-
-    for i in range(3):
-        if not transform_list[i]:
-            curve = action.fcurves.new('pose.bones["' + joint.temp_name + '"].rotation_euler', index=i)
-            transform_list[i] = curve
-            curve.keyframe_points.insert(0, 0)
-        if not transform_list[i+4]:
-            curve = action.fcurves.new('pose.bones["' + joint.temp_name + '"].location', index=i)
-            transform_list[i+4] = curve
-            curve.keyframe_points.insert(0, 0)
-        if not transform_list[i+7]:
-            curve = action.fcurves.new('pose.bones["' + joint.temp_name + '"].scale', index=i)
-            transform_list[i+7] = curve
-            curve.keyframe_points.insert(0, 1)
-
-    bonemtxinv = joint.temp_matrix_local.inverted()
-    for frame in range(int(aobjdesc.endframe)):
-        scale = list(tuple(joint.scale))
-        rotation = list(tuple(joint.rotation))
-        position = list(tuple(joint.position))
-        for i in range(3):
-            rotation[i] += transform_list[i].evaluate(frame)
-            position[i] += transform_list[i+4].evaluate(frame)
-            scale[i] *= transform_list[i+7].evaluate(frame)
-        posetargetmtx = compileSRTmtx(scale, rotation, position)
-        posemtx = bonemtxinv @ posetargetmtx
-        trans, rot, scale = posemtx.decompose()
-        for i in range(3):
-            transform_list[i].keyframe_points.insert(frame, rot[i])
-            transform_list[i+4].keyframe_points.insert(frame, trans[i])
-            transform_list[i+7].keyframe_points.insert(frame, scale[i])
 
 hsd_a_j_dict = {
     hsd.HSD_A_J_ROTX: 'HSD_A_J_ROTX',
@@ -599,6 +734,10 @@ hsd_a_j_dict = {
     hsd.HSD_A_J_SETFLOAT7: 'HSD_A_J_SETFLOAT7',
     hsd.HSD_A_J_SETFLOAT8: 'HSD_A_J_SETFLOAT8',
     hsd.HSD_A_J_SETFLOAT9: 'HSD_A_J_SETFLOAT9',
+}
+
+hsd_a_interpretation_dict = {
+    'jobj' : hsd_a_j_dict,
 }
 
 def read_fobjdesc(fobjdesc, curve, bias, scale, printd, printopcode = False):
@@ -689,27 +828,26 @@ def read_fobjdesc(fobjdesc, curve, bias, scale, printd, printopcode = False):
 
 frac_type_dict = {
     hsd.HSD_A_FRAC_FLOAT: 'HSD_A_FRAC_FLOAT',
-    hsd.HSD_A_FRAC_S16: 'HSD_A_FRAC_S16',
-    hsd.HSD_A_FRAC_U16: 'HSD_A_FRAC_U16',
-    hsd.HSD_A_FRAC_S8: 'HSD_A_FRAC_S8',
-    hsd.HSD_A_FRAC_U8: 'HSD_A_FRAC_U8',
+    hsd.HSD_A_FRAC_S16:   'HSD_A_FRAC_S16',
+    hsd.HSD_A_FRAC_U16:   'HSD_A_FRAC_U16',
+    hsd.HSD_A_FRAC_S8:    'HSD_A_FRAC_S8',
+    hsd.HSD_A_FRAC_U8:    'HSD_A_FRAC_U8',
 }
 
 opcode_dict = {
     hsd.HSD_A_OP_NONE: 'HSD_A_OP_NONE',
-    hsd.HSD_A_OP_CON: 'HSD_A_OP_CON',
-    hsd.HSD_A_OP_LIN: 'HSD_A_OP_LIN',
+    hsd.HSD_A_OP_CON:  'HSD_A_OP_CON',
+    hsd.HSD_A_OP_LIN:  'HSD_A_OP_LIN',
     hsd.HSD_A_OP_SPL0: 'HSD_A_OP_SPL0',
-    hsd.HSD_A_OP_SPL: 'HSD_A_OP_SPL',
-    hsd.HSD_A_OP_SLP: 'HSD_A_OP_SLP',
-    hsd.HSD_A_OP_KEY: 'HSD_A_OP_KEY',
+    hsd.HSD_A_OP_SPL:  'HSD_A_OP_SPL',
+    hsd.HSD_A_OP_SLP:  'HSD_A_OP_SLP',
+    hsd.HSD_A_OP_KEY:  'HSD_A_OP_KEY',
 }
 
 def read_node_values(opcode, value_type, frac_value, slope_type, frac_slope, ad, cur_pos):
     slope = 0
     val = 0
 
-    #frac_value += 1
     if opcode == hsd.HSD_A_OP_NONE:
         return 0, 0, cur_pos
 
@@ -752,12 +890,12 @@ def read_node_values(opcode, value_type, frac_value, slope_type, frac_slope, ad,
 
 interpolation_dict = {
     hsd.HSD_A_OP_NONE: 'CONSTANT',
-    hsd.HSD_A_OP_CON: 'CONSTANT',
-    hsd.HSD_A_OP_LIN: 'LINEAR',
+    hsd.HSD_A_OP_CON:  'CONSTANT',
+    hsd.HSD_A_OP_LIN:  'LINEAR',
     hsd.HSD_A_OP_SPL0: 'BEZIER',
-    hsd.HSD_A_OP_SPL: 'BEZIER',
+    hsd.HSD_A_OP_SPL:  'BEZIER',
     #hsd.HSD_A_OP_SLP: '',
-    hsd.HSD_A_OP_KEY: 'LINEAR', #?
+    hsd.HSD_A_OP_KEY:  'LINEAR', #?
 }
 
 
@@ -774,12 +912,6 @@ jointanim_type_dict = {
     hsd.HSD_A_J_SCAZ: ('scale', 2),
 }
 
-
-def add_material_animation(material_dict, animations, action):
-    pass
-
-def add_shape_animation(mesh_dict, animations, action):
-    pass
 
 spline_type_dict = {
     0 : 'POLY',
@@ -865,7 +997,7 @@ def init_geometry():
     for hsd_spline in hsd_splines.values():
         spline_dict[hsd_spline.id] = make_spline(hsd_spline)
 
-    return mesh_dict, material_dict, spline_dict
+    return mesh_dict, material_dict, spline_dict, image_dict
 
 #normalize u8 to float
 #only used for color so we can do srgb conversion here
@@ -888,6 +1020,319 @@ def norm8bit(x):
     else:
         return x / 255
 
+class SlopeHandles:
+    def __init__(self):
+        self.co = Vector((0., 0.))
+        self.slope_left = 0.
+        self.slope_right = 0.
+
+    def __add__(self, other):
+        n = SlopeHandles()
+        if isinstance(other, SlopeHandles):
+            n.co = self.co
+            n.co[1] += other.co[1]
+            n.slope_left = self.slope_left + other.slope_left
+            n.slope_right = self.slope_right + other.slope_right
+        elif isinstance(other, float) or isinstance(other, int):
+            n.co = self.co + Vector((0., other))
+            n.slope_left = self.slope_left
+            n.slope_right = self.slope_right
+        else:
+            raise TypeError('not a valid type for adding')
+        return n
+
+    def __mul__(self, other):
+        if not (isinstance(other, float) or isinstance(other, int)):
+            raise TypeError('factor not a scalar: ', type(other).__name__)
+        n = SlopeHandles()
+        n.co[0] = self.co[0]
+        n.co[1] = self.co[1] * other
+        n.slope_left = self.slope_left * other
+        n.slope_right = self.slope_right * other
+        return n
+
+    def to_handle_points(self, prev_pos, next_pos):
+        handle_left = Vector((self.co[0] - 1./3. * (self.co[0] - prev_pos), self.co[1] + -1./3. * self.slope_left))
+        handle_right = Vector((self.co[0] + 1./3. * (next_pos - self.co[0]), self.co[1] + 1./3. * self.slope_right))
+        return (Vector(self.co[:]), handle_left, handle_right)
+
+def sample_hermite_value_and_slope(t, val_a, val_b, slope_a, slope_b):
+    t2 = t*t
+    t3 = t2*t
+    h00 = 2 * t3 - 3 * t2 + 1
+    h10 = t3 - 2 * t2 + t
+    h01 = -2 * t3 + 3 * t2
+    h11 = t3 - t2
+
+    val = h00 * val_a + h10 * slope_a + h01 * val_b + h11 * slope_b
+
+    h00_ = 6 * (t2 - t)
+    h10_ = 3 * t2 - 4 * t + 1
+    h01_ = -h00_
+    h11_ = 3 * t2 - 2 * t
+
+    sl = h00_ * val_a + h10_ * slope_a + h01_ * val_b + h11_ * slope_b
+
+    return val, sl
+
+def fcurve_sample_slopehandles(prev_frame, frame_coord, next_frame):
+
+    handles = SlopeHandles()
+
+    # values left of first and right of last keyframes are constant
+    if not prev_frame:
+        prev_co = next_frame.co
+        interpolation = 'CONSTANT'
+    else:
+        prev_co = prev_frame.co
+        interpolation = prev_frame.interpolation
+
+    if not next_frame:
+        next_co = prev_frame.co
+        interpolation = 'CONSTANT'
+    else:
+        next_co = next_frame.co
+
+    if (prev_frame and frame_coord <= prev_co) or (next_frame and frame_coord >= next_co):
+        print('sampling outside current interval! This should not happen and points towards a programming error')
+        return None
+
+    if interpolation == 'CONSTANT':
+        slope = 0.
+        handles.co[:] = [frame_coord, prev_co[1]]
+    elif interpolation == 'LINEAR':
+        slope = (next_co[1] - prev_co[1]) / (next_co[0] - prev_co[0]) 
+        handles.co[:] = [frame_coord, prev_co[0] + slope * (frame_coord - prev_co[0])]
+    elif interpolation == 'BEZIER':
+        prev_slope = (prev_frame.handle_right[1] - prev_frame.co[1]) / (prev_frame.handle_right[0] - prev_frame.co[0])
+        next_slope = (next_frame.co[1] - next_frame.handle_left[1]) / (next_frame.co[0] - next_frame.handle_left[0])
+        interval = (next_co[0] - prev_co[0])
+        t = (frame_coord - prev_co[0]) / interval
+        val, sl = sample_hermite_value_and_slope(t, prev_co[1], next_co[1], prev_slope * interval, next_slope * interval)
+        slope = sl / interval
+        handles.co[:] = [frame_coord, val]
+    else:
+        print('unsupported fcurve interp type')
+        return None
+
+    handles.slope_left = slope
+    handles.slope_right = slope
+
+    return handles
+
+# this function exists because handles for interpolations other than Bezier can be arbitrary
+# it calculates more meaningful handles for those cases and handles boundary conditions
+# assumes frames are sorted
+def fcurve_point_slopehandles(frames, index):
+
+    frame = frames[index]
+
+    handles = SlopeHandles()
+    handles.co[:] = frame.co[:]
+
+    if index > 0:
+        prev_frame = None
+    else:
+        prev_frame = frames[index - 1]
+    if index < len(frames) - 1:
+        next_frame = frames[index + 1]
+    else:
+        next_frame = None
+    
+    if not prev_frame or prev_frame.interpolation == 'CONSTANT':
+        handles.slope_left = 0.
+    elif prev_frame.interpolation == 'LINEAR':
+        handles.slope_left = (frame.co[1] - prev_frame.co[1]) / (frame.co[0] - prev_frame.co[0])
+    elif prev_frame.interpolation == 'BEZIER':
+        handles.slope_left = (frame.co[1] - frame.handle_left[1]) / (frame.co[0] - frame.handle_left[0])
+
+    if not next_frame or frame.interpolation == 'CONSTANT':
+        handles.slope_right = 0.
+    elif frame.interpolation == 'LINEAR':
+        handles.slope_right = (next_frame.co[1] - frame.co[1]) / (next_frame.co[0] - frame.co[0])
+    elif frame.interpolation == 'BEZIER':
+        handles.slope_right = (frame.handle_right[1] - frame.co[1]) / (frame.handle_right[0] - frame.co[0])
+
+    return handles
+
+_interp_ordering = ['CONSTANT', 'LINEAR', 'BEZIER']
+
+def max_interpolation(interp_a, interp_b):
+    a = _interp_ordering.index(interp_a)
+    b = _interp_ordering.index(interp_b)
+    c = max(a, b)
+    return _interp_ordering[c]
+
+# assumes curves are sorted
+def closest_frames(coordinate, curves, prev_indices):
+
+    left_closest = None
+    right_closest = None
+    for idx, curve in zip(prev_indices, curves):
+        for frame in curve.keyframe_points[idx:]:
+            if frame.co[0] < coordinate: 
+                if not left_closest or left_closest < frame.co[0]:
+                    left_closest = frame.co[0]
+
+            if frame.co[0] > coordinate: 
+                if not right_closest or right_closest > frame.co[0]:
+                    right_closest = frame.co[0]
+                break
+    
+    if not left_closest:
+        left_closest = coordinate - 1.
+    if not right_closest:
+        right_closest = coordinate + 1.
+    
+    return (left_closest, right_closest)
+
+# computes fa * a + fb * b + fc and stores it in curve a
+# TODO: need to handle discontinuous const tracks differently, those are not in the continuous vector space
+def affine_fcurve_combination(a, fa, b, fb, fc):
+    a.keyframe_points.sort()
+    b.keyframe_points.sort()
+    # first step: calculate new keyframes and modifications to existing ones
+    new_keyframes = []
+    old_keyframes = []
+    i = 0
+    for j, frame_b in enumerate(b.keyframe_points):
+        prev_frame_b = None
+        if j > 0:
+            prev_frame_b = b.keyframe_points[i - 1]
+            prev_interpolation = prev_frame_b.interpolation
+        else:
+            prev_frame_b = None
+            prev_interpolation = 'CONSTANT'
+        next_frame_b = frame_b
+        while i < len(a.keyframe_points) and a.keyframe_points[i].co[0] < frame_b.co[0]: # a frames between previous b frame and current b frame
+            frame_a = a.keyframe_points[i]
+            a_handles = fcurve_point_slopehandles(a.keyframe_points, i)
+            b_handles = fcurve_sample_slopehandles(prev_frame_b, frame_a.co[0], next_frame_b)
+            handles = b_handles * fb + a_handles * fa + fc
+            interpolation = max_interpolation(prev_interpolation, frame_a.interpolation)
+            old_keyframes.append((handles.to_handle_points(*closest_frames(frame_a.co[0], (a, b), (max(0, i-1), max(0, j-1)))), interpolation))
+            i += 1
+        if i < len(a.keyframe_points) and a.keyframe_points[i].co[0] == frame_b.co[0]: # a frame overlapping with current b frame
+            frame_a = a.keyframe_points[i]
+            a_handles = fcurve_point_slopehandles(a.keyframe_points, i)
+            b_handles = fcurve_point_slopehandles(b.keyframe_points, j)
+            handles = b_handles * fb + a_handles * fa + fc
+            interpolation = max_interpolation(frame_b.interpolation, frame_a.interpolation)
+            old_keyframes.append((handles.to_handle_points(*closest_frames(frame_a.co[0], (a, b), (max(0, i-1), max(0, j-1)))), interpolation))
+            i += 1
+        else: # b frame between previous a frame and current a frame
+            if i > 0:
+                prev_frame_a = a.keyframe_points[i - 1]
+                prev_interpolation = prev_frame_a.interpolation
+            else:
+                prev_frame_a = None
+                prev_interpolation = 'CONSTANT'
+            if i < len(a.keyframe_points):
+                next_frame_a = a.keyframe_points[i]
+            else:
+                next_frame_a = None
+            a_handles = fcurve_sample_slopehandles(prev_frame_a, frame_b.co[0], next_frame_a)
+            b_handles = fcurve_point_slopehandles(b.keyframe_points, j)
+            handles = b_handles * fb + a_handles * fa + fc
+            interpolation = max_interpolation(prev_interpolation, frame_b.interpolation)
+            new_keyframes.append((handles.to_handle_points(*closest_frames(frame_b.co[0], (a, b), (max(0, i-1), max(0, j-1)))), interpolation))
+
+    while i < len(a.keyframe_points): # a frames after last b frame
+        frame_a = a.keyframe_points[i]
+        prev_frame_b = b.keyframe_points[-1]
+        next_frame_b = None
+        a_handles = fcurve_point_slopehandles(a.keyframe_points, i)
+        b_handles = fcurve_sample_slopehandles(prev_frame_b, frame_a.co[0], next_frame_b)
+        handles = b_handles * fb + a_handles * fa + fc
+        # const past last keyframe
+        interpolation = frame_a.interpolation
+        old_keyframes.append((handles.to_handle_points(*closest_frames(frame_a.co[0], (a, b), (max(0, i-1), -1))), interpolation))
+        i += 1
+
+    if len(old_keyframes) != len(a.keyframe_points):
+        print('EROUR: mismatching keyframe counts: ', len(old_keyframes), len(a.keyframe_points))
+        exit()
+
+    print('new keyframes: ', len(new_keyframes))
+    print('b keyframes: ', len(b.keyframe_points))
+    print('total keyframes: ', len(new_keyframes) + len(old_keyframes))
+
+    # second step: insert extra keyframes and change existing ones
+    for modified, existing in zip(old_keyframes, a.keyframe_points):
+        handles, interpolation = modified
+        existing.co[:] = handles[0]
+        existing.handle_left[:] = handles[1]
+        existing.handle_right[:] = handles[2]
+        existing.interpolation = interpolation
+
+    for new in new_keyframes:
+        handles, interpolation = new
+        a_frame = a.keyframe_points.insert(handles[0][0], handles[0][1], options = set(['NEEDED', 'FAST']))
+        a_frame.interpolation = interpolation
+        a_frame.left_handle[:] = handles[1]
+        a_frame.right_handle[:] = handles[2]
+
+# this function is linear, so no baking is required when using this for animations
+def to_blender_uvs(trans, rot, scale, texdesc):
+    trans = list(trans)
+    rot = list(rot)
+    scale = list(scale)
+    trans[1] = (1. - scale[1] * texdesc.repeat_t) - trans[1]
+    scale[1] /= texdesc.repeat_t
+    scale[0] /= texdesc.repeat_s
+    #TODO: Is this correct?
+    if (texdesc.flag & hsd.TEX_COORD_MASK) == hsd.TEX_COORD_REFLECTION:
+        rot[2] -= math.pi/2
+    return trans, rot, scale 
+
+def curves_to_blender_uvs(uv_curves, texdesc, location1_curve):
+
+    # correction for Location1
+    if "Location1" in uv_curves:
+        if "Scale1" in uv_curves:
+            loc_curve = uv_curves["Location1"]
+            scale_curve = uv_curves["Scale1"]
+            affine_fcurve_combination(loc_curve, -1., scale_curve, -texdesc.repeat_t, 1.)
+        else:
+            for keyframe in uv_curves["Location1"].keyframe_points:
+                keyframe.co[1]           = (1. - texdesc.scale[1] * texdesc.repeat_t) - keyframe.co[1]
+                keyframe.handle_left[1]  = (1. - texdesc.scale[1] * texdesc.repeat_t) - keyframe.handle_left[1]
+                keyframe.handle_right[1] = (1. - texdesc.scale[1] * texdesc.repeat_t) - keyframe.handle_right[1]
+    else:
+        if "Scale1" in uv_curves:
+            # populate new curve for the corrected offset
+            loc_curve = location1_curve
+            scale_curve = uv_curves["Scale1"]
+            loc_curve.add(len(scale_curve.keyframe_points))
+            for loc_frame, scale_frame in zip(loc_curve.keyframe_points, scale_curve.keyframe_points):
+                loc_frame.co[0]           = scale_frame.co[0]
+                loc_frame.handle_left[0]  = scale_frame.handle_left[0]
+                loc_frame.handle_right[0] = scale_frame.handle_right[0]
+                loc_frame.co[1]           = (1. - scale_frame.co[1]            * texdesc.repeat_t) - texdesc.translate[1]
+                loc_frame.handle_left[1]  = (1. - scale_frame.handle_left[1]   * texdesc.repeat_t) - texdesc.translate[1]
+                loc_frame.handle_right[1] = (1. - scale_frame.chandle_right[1] * texdesc.repeat_t) - texdesc.translate[1]
+
+    if "Scale0" in uv_curves:
+        for keyframe in uv_curves["Scale0"].keyframe_points:
+            keyframe.co[1]           /= texdesc.repeat_s
+            keyframe.handle_left[1]  /= texdesc.repeat_s
+            keyframe.handle_right[1] /= texdesc.repeat_s
+
+    if "Scale1" in uv_curves:
+        for keyframe in uv_curves["Scale1"].keyframe_points:
+            keyframe.co[1]           /= texdesc.repeat_t
+            keyframe.handle_left[1]  /= texdesc.repeat_t
+            keyframe.handle_right[1] /= texdesc.repeat_t
+
+    
+
+    if "Rotation2" in uv_curves and (texdesc.flag & hsd.TEX_COORD_MASK) == hsd.TEX_COORD_REFLECTION:
+        for keyframe in uv_curves["Rotation2"].keyframe_points:
+            keyframe.co[1]           -= math.pi/2
+            keyframe.handle_left[1]  -= math.pi/2
+            keyframe.handle_right[1] -= math.pi/2
+
+
 def make_approx_cycles_material(mobj, image_dict):
     material = mobj.mat
     mat = bpy.data.materials.new('')
@@ -900,6 +1345,12 @@ def make_approx_cycles_material(mobj, image_dict):
         nodes.remove(node)
     output = nodes.new('ShaderNodeOutputMaterial')
     #nodes.remove(diff)
+
+    # references to specific nodes for animation
+    class AnimDummy:
+        pass
+    anim_ref = AnimDummy()
+    mobj.animation_references = anim_ref 
 
     mat_diffuse_color = normcolor(material.diffuse)
 
@@ -946,6 +1397,10 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
             break
 
     print('textures: %d' % len(textures))
+
+    anim_ref.diffuse = None
+    anim_ref.alpha = None
+    anim_ref.specular = None
     
     diffuse_flags = mobj.rendermode & hsd.RENDER_DIFFUSE_BITS
     if diffuse_flags == hsd.RENDER_DIFFUSE_MAT0:
@@ -961,16 +1416,19 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
             color.outputs[0].default_value[:] = [1,1,1,1]
         else:
             color.outputs[0].default_value[:] = mat_diffuse_color
+            anim_ref.diffuse = color.outputs[0]
 
         alpha = nodes.new('ShaderNodeValue')
         if alpha_flags == hsd.RENDER_ALPHA_VTX:
             alpha.outputs[0].default_value = 1
         else:
             alpha.outputs[0].default_value = material.alpha
+            anim_ref.alpha = alpha.outputs[0]
     else:
         if diffuse_flags == hsd.RENDER_DIFFUSE_MAT:
             color = nodes.new('ShaderNodeRGB')
             color.outputs[0].default_value[:] = mat_diffuse_color
+            anim_ref.diffuse = color.outputs[0]
         else:
             #Toon not supported
             #if toon:
@@ -989,6 +1447,7 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
             if not (diffuse_flags == hsd.RENDER_DIFFUSE_VTX):
                 diff = nodes.new('ShaderNodeRGB')
                 diff.outputs[0].default_value[:] = mat_diffuse_color
+                anim_ref.diffuse = diff.outputs[0]
                 mix = nodes.new('ShaderNodeMixRGB')
                 mix.blend_type = 'ADD'
                 mix.inputs[0].default_value = 1
@@ -999,6 +1458,7 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
         if alpha_flags == hsd.RENDER_ALPHA_MAT:
             alpha = nodes.new('ShaderNodeValue')
             alpha.outputs[0].default_value = material.alpha
+            anim_ref.alpha = alpha.outputs[0]
         else:
             alpha = nodes.new('ShaderNodeAttribute')
             alpha.attribute_name = 'alpha_0'
@@ -1006,6 +1466,7 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
             if not (alpha_flags == hsd.RENDER_ALPHA_VTX):
                 mat_alpha = nodes.new('ShaderNodeValue')
                 mat_alpha.outputs[0].default_value = material.alpha
+                anim_ref.alpha = mat_alpha.outputs[0]
                 mix = nodes.new('ShaderNodeMath')
                 mix.operation = 'MULTIPLY'
                 links.new(alpha.outputs[0], mix.inputs[0])
@@ -1021,8 +1482,10 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
     if mobj.rendermode & hsd.RENDER_SPECULAR:
         spec = nodes.new('ShaderNodeRGB')
         spec.outputs[0].default_value[:] = normcolor(material.specular)
+        anim_ref.specular = spec.outputs[0]
         last_specular = spec.outputs[0]
 
+    anim_ref.texture_nodes = [None] * tex_num
     for texdesc in textures:
         if (texdesc.flag & hsd.TEX_COORD_MASK) == hsd.TEX_COORD_UV:
             uv = nodes.new('ShaderNodeUVMap')
@@ -1035,21 +1498,23 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
             print('UV Type not supported: %X' % (texdesc.flag & hsd.TEX_COORD_MASK))
             uv_output = None
 
+        trans, rot, scale = to_blender_uvs(texdesc.translate, texdesc.rotate, texdesc.scale, texdesc)
+
         mapping = nodes.new('ShaderNodeMapping')
         mapping.vector_type = 'TEXTURE'
-        mapping.inputs[1].default_value = texdesc.translate #mapping.translation[:]
-        mapping.inputs[2].default_value = texdesc.rotate #mapping.rotate[:]
-        mapping.inputs[3].default_value = texdesc.scale #mapping.scale[:]
+        mapping.inputs[1].default_value = trans #mapping.translation[:]
+        mapping.inputs[2].default_value = rot #mapping.rotate[:]
+        mapping.inputs[3].default_value = scale #mapping.scale[:]
 
-        mapping.inputs[3].default_value[0] /= texdesc.repeat_s
-        mapping.inputs[3].default_value[1] /= texdesc.repeat_t
+        # mapping.inputs[3].default_value[0] /= texdesc.repeat_s
+        # mapping.inputs[3].default_value[1] /= texdesc.repeat_t
 
         #blender UV coordinates are relative to the bottom left so we need to account for that
-        mapping.inputs[1].default_value[1] = (1. - texdesc.scale[1] * texdesc.repeat_t) - mapping.inputs[1].default_value[1]
+        # mapping.inputs[1].default_value[1] = (1. - texdesc.scale[1] * texdesc.repeat_t) - mapping.inputs[1].default_value[1]
 
-        #TODO: Is this correct?
-        if (texdesc.flag & hsd.TEX_COORD_MASK) == hsd.TEX_COORD_REFLECTION:
-            mapping.inputs[2].default_value[0] -= math.pi/2
+        
+        # if (texdesc.flag & hsd.TEX_COORD_MASK) == hsd.TEX_COORD_REFLECTION:
+        #     mapping.inputs[2].default_value[0] -= math.pi/2
 
         texture = nodes.new('ShaderNodeTexImage')
         texture.image = image_dict[texdesc.id]
@@ -1079,6 +1544,11 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
             links.new(uv_output, mapping.inputs[0])
         links.new(mapping.outputs[0], texture.inputs[0])
 
+        color_tev = None
+        alpha_tev = None
+        color_mix = None
+        alpha_mix = None
+
         cur_color = texture.outputs[0]
         cur_alpha = texture.outputs[1]
         #do tev
@@ -1086,10 +1556,12 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
             tev = texdesc.tev
             if tev.active & hsd.TOBJ_TEVREG_ACTIVE_COLOR_TEV:
                 inputs = [make_tev_input(nodes, texture, tev, i, True) for i in range(4)]
+                color_tev = inputs
                 cur_color = make_tev_op(nodes, links, inputs, tev, True)
 
             if tev.active & hsd.TOBJ_TEVREG_ACTIVE_ALPHA_TEV:
                 inputs = [make_tev_input(nodes, texture, tev, i, False) for i in range(4)]
+                alpha_tev = inputs
                 cur_alpha = make_tev_op(nodes, links, inputs, tev, False)
 
             texture.name += ' tev'
@@ -1154,6 +1626,7 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
                         last_specular = mix.outputs[0]
                     if texdesc.flag & (hsd.TEX_LIGHTMAP_DIFFUSE | hsd.TEX_LIGHTMAP_AMBIENT | hsd.TEX_LIGHTMAP_EXT):
                         last_color = mix.outputs[0]
+                    color_mix = mix
                 #do alpha
                 alphamap = texdesc.flag & hsd.TEX_ALPHAMAP_MASK
                 if not (alphamap == hsd.TEX_ALPHAMAP_NONE or
@@ -1185,6 +1658,9 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
                         links.new(cur_alpha, mix.inputs[1])
 
                     last_alpha = mix.outputs[0]
+                    alpha_mix = mix
+
+        anim_ref.texture_nodes[texdesc.texid] = (mapping, texture, (color_mix, alpha_mix), (color_tev, alpha_tev))
 
     if mobj.rendermode & hsd.RENDER_DIFFUSE:
         #no alpha light support
@@ -1445,6 +1921,7 @@ active: %.8X' % ((tev.color_op, tev.alpha_op, tev.color_bias, tev.alpha_bias,\
     output.name += ' Pedesc: ' + (pedesc_type_dict[mobj.pedesc.type] if mobj.pedesc else 'False')
     if mobj.pedesc and mobj.pedesc.type == gx.GX_BM_BLEND:
         output.name += ' ' + pedesc_src_factor_dict[mobj.pedesc.src_factor] + ' ' + pedesc_dst_factor_dict[mobj.pedesc.dst_factor]
+    
 
     return mat
 
@@ -2539,7 +3016,6 @@ def make_mesh_object(pobj, name):
     # Create mesh from given verts, edges, faces. Either edges or
     # faces should be [], or you ask for problems
 
-    # TODO: figure out how the lists of normals and other vertex attributes and skin weights are generated to account for removed faces
     facelists, faces = validate_mesh(facelists, faces)
 
     me.from_pydata(vertices, [], faces)
